@@ -125,10 +125,28 @@ pub const Trouble = struct {
     revoke_failed: usize = 0,
     add_failed: usize = 0,
     unattributed: usize = 0,
+    /// 这一轮拉到的历史里有多少条消息的时间戳读不出来。**故意不进 `any()`**：
+    /// 上面三类都是"重扫一遍还有机会补上"的失败，压住 setLastRun 是对的；
+    /// 坏时间戳不是——同一条消息下一轮还是同样的坏时间戳，压住只会让这个群
+    /// 永久卡在原地，把一次性的坏数据变成自我持续的死锁（跟"作者已离群"那次
+    /// 卡死是同一种形状，见下面 authorNickname 调用点的注释）。
+    ///
+    /// 但它也绝不能被算作成功：这些消息既进不了判定窗口（`inWindow(0, ...)`
+    /// 恒假）也不参与翻页锚点，对这一轮完全不存在——其中要是有一条 💦，那条
+    /// 撤稿指令就永久没了。所以它压掉 `Successfully in Ns.`（见 `reportable`），
+    /// 只是不压 lastrun。
+    unusable_times: usize = 0,
     last_err: []const u8 = "",
 
+    /// 这一轮该不该判失败（= 不写 setLastRun、让下一轮从旧起点重新覆盖）。
     pub fn any(self: Trouble) bool {
         return self.revoke_failed > 0 or self.add_failed > 0 or self.unattributed > 0;
+    }
+
+    /// 这一轮该不该在群里改口——只要有任何一件事没看清楚，第七行就不能是
+    /// `Successfully in Ns.`。比 `any()` 多一类：坏时间戳（见字段注释）。
+    pub fn reportable(self: Trouble) bool {
+        return self.any() or self.unusable_times > 0;
     }
 };
 
@@ -152,6 +170,10 @@ pub fn troubleReason(gpa: std.mem.Allocator, t: Trouble) ![]u8 {
         // （群级，整批候选不写）与某个作者的 QQ 原始昵称问不出来（候选级，只有
         // 那个作者名下的候选不写），见 Trouble.unattributed 的字段注释。
         try w.print("{d} quote(s) not written: attribution unavailable", .{t.unattributed});
+    }
+    if (t.unusable_times > 0) {
+        if (out.items.len > 0) try w.writeAll("; ");
+        try w.print("{d} message(s) had no usable timestamp and could not be evaluated", .{t.unusable_times});
     }
     if (t.last_err.len > 0) {
         try w.print(" (last error: {s})", .{t.last_err});
@@ -235,13 +257,34 @@ fn hasUsableTime(m: onebot.Message) bool {
     return m.time > 0;
 }
 
-pub fn oldestTime(msgs: []const onebot.Message) ?i64 {
-    var lo: ?i64 = null;
+/// 这一页里最老和最新的各一条，按 `messageBefore` 的 (time, message_id) 全序
+/// 取。`logPage` 用它报每页的边界，README 的两条线上假设都靠那行日志核对
+/// （#1 `message_seq` 是不是 `message_id`、#2 边界是否闭区间），做法是比较
+/// 相邻两页的 oldest/newest ——所以它报的必须跟翻页锚点（`oldestId`）取的是
+/// **同一条**消息，否则那行日志恰好会在需要它的时候（页里掺着坏时间戳）说谎。
+pub const PageBounds = struct { oldest: onebot.Message, newest: onebot.Message };
+
+pub fn pageBounds(msgs: []const onebot.Message) ?PageBounds {
+    var bounds: ?PageBounds = null;
     for (msgs) |m| {
+        // 时间戳不可用的消息一律不参与，理由同 `hasUsableTime`：它按
+        // (time, id) 排序会一路排到最前面，报出去就是一条位置未知的消息。
         if (!hasUsableTime(m)) continue;
-        lo = if (lo) |cur| @min(cur, m.time) else m.time;
+        const cur = bounds orelse {
+            bounds = .{ .oldest = m, .newest = m };
+            continue;
+        };
+        bounds = .{
+            .oldest = if (messageBefore({}, m, cur.oldest)) m else cur.oldest,
+            .newest = if (messageBefore({}, cur.newest, m)) m else cur.newest,
+        };
     }
-    return lo;
+    return bounds;
+}
+
+pub fn oldestTime(msgs: []const onebot.Message) ?i64 {
+    const bounds = pageBounds(msgs) orelse return null;
+    return bounds.oldest.time;
 }
 
 /// 时间并列时按 message_id 取最小者，保证与输入顺序无关的确定性。
@@ -249,18 +292,8 @@ pub fn oldestTime(msgs: []const onebot.Message) ?i64 {
 /// （下一页的 message_seq）就可能因为并列消息里挑中了不是最老的那条
 /// 而漏掉同一秒内排在它前面的消息。
 pub fn oldestId(msgs: []const onebot.Message) ?i64 {
-    var best: ?onebot.Message = null;
-    for (msgs) |m| {
-        // 时间戳不可用的消息不能当锚点：它按 (time, id) 排序会一路排到最前面，
-        // 把翻页方向锚在一条位置未知的消息上。理由同 hasUsableTime。
-        if (!hasUsableTime(m)) continue;
-        const cur = best orelse {
-            best = m;
-            continue;
-        };
-        if (m.time < cur.time or (m.time == cur.time and m.message_id < cur.message_id)) best = m;
-    }
-    return if (best) |m| m.message_id else null;
+    const bounds = pageBounds(msgs) orelse return null;
+    return bounds.oldest.message_id;
 }
 
 /// 群消息的统一时间顺序：先按秒级时间戳，再按 message_id 打破同秒并列。
@@ -717,7 +750,7 @@ pub const PageStop = struct {
     reached_start: bool,
 };
 
-pub fn pageStopReason(data: std.json.Value, parsed_len: usize) ?PageStop {
+pub fn pageStopReason(data: std.json.Value, parsed_len: usize, first_page: bool) ?PageStop {
     const obj = switch (data) {
         .object => |o| o,
         else => return .{ .reason = "get_group_msg_history reply was not an object", .reached_start = false },
@@ -729,12 +762,26 @@ pub fn pageStopReason(data: std.json.Value, parsed_len: usize) ?PageStop {
         .array => |items| items.items.len,
         else => return .{ .reason = "get_group_msg_history messages field is not an array", .reached_start = false },
     };
-    return if (raw_len == 0)
-        // 空页 = 这个群的历史到头了，再往前**没有**消息。窗口是被完整覆盖过的，
-        // 哪怕它的起点比这个群的第一条消息还早。
-        .{ .reason = "empty page (reached the start of the group's history)", .reached_start = true }
-    else
-        .{ .reason = "page carried messages but none of them could be parsed", .reached_start = false };
+    if (raw_len != 0) {
+        return .{ .reason = "page carried messages but none of them could be parsed", .reached_start = false };
+    }
+    // 空页在**翻页途中**（已经拿到过至少一页）= 这个群的历史到头了，再往前
+    // **没有**消息。窗口是被完整覆盖过的，哪怕它的起点比这个群的第一条消息
+    // 还早。历史比窗口短的小群天天走这条路，绝不能给它们报"覆盖不全"。
+    if (!first_page) {
+        return .{ .reason = "empty page (reached the start of the group's history)", .reached_start = true };
+    }
+    // 但第一页就空是另一回事：这一轮**一条消息都没拿到**，而"这个群真的一条
+    // 消息都没有"跟"NapCat 限流/抖动回了个空数组"在这里长得完全一样。按前者
+    // 处理就是把整个窗口——连同其中只会被看到一次的 💦——安静地宣布为已扫过，
+    // pages=0、pool 空、不打警告、不顶 lastrun、群里照报 Successfully in Ns.，
+    // 正是这套代码从头到尾在防的那种静默数据丢失。分不清就按"没覆盖完"处理：
+    // 代价是真正空的群会挨一条警告并被顶住窗口，而这个顶是有界的
+    // （见 commitAfterHold 的 hold floor：最多顶到回看上限前一天就放手）。
+    return .{
+        .reason = "empty first page (no history at all — cannot tell an empty group from a throttled reply)",
+        .reached_start = false,
+    };
 }
 
 fn fetchPage(
@@ -774,7 +821,7 @@ fn fetchPage(
     // parseMessages 对 null / 非数组一律返回空切片，形状判断统一交给
     // pageStopReason，这里不重复判一遍。
     const msgs = try onebot.parseMessages(arena, arr);
-    return .{ .msgs = msgs, .stop = pageStopReason(data, msgs.len) };
+    return .{ .msgs = msgs, .stop = pageStopReason(data, msgs.len, before_id == null) };
 }
 
 /// 每页打一行 info：页序号、条数、最老/最新一条的 message_id 与 time。
@@ -783,13 +830,9 @@ fn fetchPage(
 /// 看相邻两页的首尾 message_id 有没有重叠。ReleaseSafe 下 std.log 的默认级别
 /// 就是 info，所以按 README 的推荐构建方式跑起来就能直接看到。
 fn logPage(gid: u64, page_index: usize, msgs: []const onebot.Message) void {
-    if (msgs.len == 0) return;
-    var oldest = msgs[0];
-    var newest = msgs[0];
-    for (msgs[1..]) |m| {
-        if (m.time < oldest.time or (m.time == oldest.time and m.message_id < oldest.message_id)) oldest = m;
-        if (m.time > newest.time or (m.time == newest.time and m.message_id > newest.message_id)) newest = m;
-    }
+    const bounds = pageBounds(msgs) orelse return;
+    const oldest = bounds.oldest;
+    const newest = bounds.newest;
     std.log.info(
         "group {d}: history page {d}: {d} message(s); oldest message_id={d} time={d}; newest message_id={d} time={d}",
         .{ gid, page_index, msgs.len, oldest.message_id, oldest.time, newest.message_id, newest.time },
@@ -848,13 +891,22 @@ pub fn unusableTimeSummary(buf: []u8, msgs: []const onebot.Message) ?[]const u8 
     return buf[0..n];
 }
 
-fn warnUnusableTimes(gid: u64, page_index: usize, msgs: []const onebot.Message) void {
+/// 返回这一页里时间戳不可用的条数，让 scanGroup 把它累进 `Trouble`——群里
+/// 那七行是运营方唯一的运行信号，一条只进 std.log 的 warn 拦不住第七行照报
+/// `Successfully in Ns.`。
+fn warnUnusableTimes(gid: u64, page_index: usize, msgs: []const onebot.Message) usize {
+    var bad: usize = 0;
+    for (msgs) |m| {
+        if (!hasUsableTime(m)) bad += 1;
+    }
+    if (bad == 0) return 0;
     var buf: [unusable_summary_buf_len]u8 = undefined;
-    const summary = unusableTimeSummary(&buf, msgs) orelse return;
+    const summary = unusableTimeSummary(&buf, msgs) orelse return bad;
     std.log.warn(
         "group {d}: history page {d}: {s}; they are excluded from this run's window and from pagination anchoring",
         .{ gid, page_index, summary },
     );
+    return bad;
 }
 
 /// 翻页护栏：一轮里最多拉多少页历史。
@@ -870,6 +922,14 @@ fn warnUnusableTimes(gid: u64, page_index: usize, msgs: []const onebot.Message) 
 /// 比它更长，而 `--last` 能造出任意长的强制窗口，护栏不能跟着一起跑飞。
 /// 跨度非正（时钟回拨、lastrun 存了未来值）时退回基准值而不是 0——一页都不拉
 /// 会直接判"覆盖不全"，把这个群永久顶死在原地。
+///
+/// 内存代价是明说的：`page_guard_max * page_size` = 28 万条历史，整份留在这个
+/// 群的 arena 上活到扫完（`Message.segments` 是指进各页 JSON 的切片，单条释放
+/// 不得），比 24 小时窗口时代的 4 万条高 7 倍。这是"忙群在长窗口下必须扫得完"
+/// 换来的——再压一道更紧的条数上限就等于把 733d1fd 修掉的那个死循环放回来
+/// （扫不完 → 判覆盖不全 → 顶窗口 → 窗口更长 → 更扫不完）。真正跟着这个数
+/// 一起长的 CPU 代价已经拆掉了：pool 上按 message_id 的四处线性扫描改成了
+/// `PoolIndex`。
 pub const pages_per_day: usize = 200;
 pub const page_guard_min: usize = pages_per_day;
 pub const page_guard_max: usize = pages_per_day *
@@ -1047,6 +1107,12 @@ const WindowPlan = struct {
     start: i64,
     /// null = 这一轮不许推进 lastrun（哪怕扫描本身成功）。
     commit_at: ?i64,
+    /// 这个群 Redis 里存着的 lastrun 原值（读失败/没有键时为 null）。
+    /// `commitAfterHold` 拿它当下限：顶窗口只该推迟提交，绝不该把 lastrun
+    /// 倒退到一段**已经扫过**的历史之前去。这里顺手带出来而不是让
+    /// `commitAfterHold` 自己再读一次 Redis——值本来就在手上，多一次往返
+    /// 只会给每个群每轮平白加一次 GET。
+    stored_last: ?i64 = null,
 };
 
 /// 单个群这一轮扫描窗口的起点：读它自己的 `hikari:lastrun:{group_id}`交给
@@ -1079,7 +1145,7 @@ fn resolveWindowStart(st: *store.Store, group_id: u64, run_at: i64, lookback_sec
             "group {d}: getLastRun failed ({s}); scanning a fixed 24h window instead of the real catch-up span, and NOT advancing lastrun — the next run will retry from the stored value",
             .{ group_id, @errorName(e) },
         );
-        return .{ .start = run_at - 86400, .commit_at = null };
+        return .{ .start = run_at - scheduler.seconds_per_day, .commit_at = null };
     };
     const win = scheduler.windowStart(run_at, last_run);
     if (win.clamped) {
@@ -1088,7 +1154,7 @@ fn resolveWindowStart(st: *store.Store, group_id: u64, run_at: i64, lookback_sec
             .{ group_id, run_at - last_run.?, scheduler.max_lookback_seconds, win.start, last_run.?, win.start },
         );
     }
-    return .{ .start = win.start, .commit_at = run_at };
+    return .{ .start = win.start, .commit_at = run_at, .stored_last = last_run };
 }
 
 /// 这一轮有引用目标彻底解析不了时，lastrun 该顶在哪个时刻。没有则 null。
@@ -1119,6 +1185,7 @@ fn resolveWindowStart(st: *store.Store, group_id: u64, run_at: i64, lookback_sec
 fn unresolvedHold(
     window: []const onebot.Message,
     pool: []const onebot.Message,
+    index: PoolIndex,
     unresolved: []const i64,
     p: rules.Params,
 ) ?i64 {
@@ -1129,18 +1196,49 @@ fn unresolvedHold(
         const rid = m.replyTarget() orelse continue;
         const hit = blk: {
             if (containsId(unresolved, rid)) break :blk true;
-            for (pool) |candidate| {
-                if (candidate.message_id != rid) continue;
-                const hop = rules.triggerTarget(candidate, p) orelse break;
-                break :blk containsId(unresolved, hop);
-            }
-            break :blk false;
+            const candidate = index.lookup(pool, rid) orelse break :blk false;
+            const hop = rules.triggerTarget(candidate, p) orelse break :blk false;
+            break :blk containsId(unresolved, hop);
         };
         if (!hit) continue;
         earliest = if (earliest) |cur| @min(cur, m.time) else m.time;
     }
     return earliest;
 }
+
+/// pool 的 `message_id` → 下标索引。
+///
+/// scanGroup 要在 pool 里按 message_id 找东西的地方有三处：补拉 reply 目标、
+/// 💦 的一跳、把补好 at 名字的 segments 同步回 window，外加 `unresolvedHold`
+/// 一处。四处原本都是裸的线性扫描，合起来是 O(window × pool)。护栏按窗口跨度
+/// 放大之后 pool 最多能装 `page_guard_max * page_size` 条，而窗口被顶长的群
+/// 恰恰就是 pool 最大的那些群——几万 × 几十万次 message_id 比较，每轮一遍。
+///
+/// 只存下标不存消息本体：pool 是 `std.ArrayList`，追加时会搬家，存切片/指针
+/// 会悬垂。
+const PoolIndex = struct {
+    map: std.AutoHashMapUnmanaged(i64, usize) = .empty,
+
+    fn deinit(self: *PoolIndex, a: std.mem.Allocator) void {
+        self.map.deinit(a);
+    }
+
+    /// `message_seq` 是闭区间，锚点消息会重复出现在下一页里，所以 pool 里
+    /// 同一个 message_id 可能有多份。**保留第一份**，跟改成索引之前那些
+    /// `for (pool) |p| if (p.message_id == rid) break;` 的取法逐字一致。
+    fn add(self: *PoolIndex, a: std.mem.Allocator, id: i64, at: usize) !void {
+        const gop = try self.map.getOrPut(a, id);
+        if (!gop.found_existing) gop.value_ptr.* = at;
+    }
+
+    fn index(self: PoolIndex, id: i64) ?usize {
+        return self.map.get(id);
+    }
+
+    fn lookup(self: PoolIndex, pool: []const onebot.Message, id: i64) ?onebot.Message {
+        return pool[self.index(id) orelse return null];
+    }
+};
 
 fn containsId(ids: []const i64, id: i64) bool {
     for (ids) |x| if (x == id) return true;
@@ -1165,13 +1263,72 @@ fn containsId(ids: []const i64, id: i64) bool {
 ///
 /// 最坏情况是有界的：某件事永久看不清楚时，窗口起点钉在那里逐日变长，到 7 天
 /// 上限被 clamp 跳过并告警，届时自愈。期间收录照常进行。
-fn commitAfterHold(plan_commit: ?i64, hold: ?i64) ?i64 {
+fn commitAfterHold(plan_commit: ?i64, hold: ?i64, stored_last: ?i64, run_at: i64) ?i64 {
     // 本来就不许推进（--last 接不上、getLastRun 读失败）时，这里无从加码。
     const commit = plan_commit orelse return null;
     const held = hold orelse return commit;
     // 取较小者：hold 理论上一定 < run_at，但它来自群消息的时间戳、不可全信，
     // 拿 min 兜住，绝不让这条路径反过来把 lastrun 推得更远。
-    return @min(commit, held);
+    const pulled_back = @min(commit, held);
+    // 再拿下限兜一次，见 hold_floor 的说明。下限本身不许反过来把 lastrun
+    // 推得比这一轮允许提交的位置更远，所以先跟 commit 取 min。
+    return @max(pulled_back, @min(holdFloor(stored_last, run_at), commit));
+}
+
+/// 顶窗口的下限：`commitAfterHold` 无论如何都不会把 lastrun 写到比它更早的
+/// 地方。两个来源，取更晚的那个：
+///
+///   - **已经扫过的位置**（`stored_last`）。顶窗口的语义是"这一轮先别提交"，
+///     不是"把之前提交过的也收回来"。少了这道护栏，`--last 7d` 打在一个只
+///     落后一小时的健康群上、又恰好有一页读不动时，`@min` 会把这个群的
+///     lastrun 整整回拨 7 天；下一轮 `run_at - lastrun` 越过回看上限，
+///     `windowStart` clamp 并打出"这段永远不会被重扫、其中的 💦 不可恢复"
+///     ——为一段其实早就扫过的历史。
+///
+///   - **回看上限前一天**（`run_at - max_lookback_seconds + seconds_per_day`）。
+///     某件事永久看不清楚（引用目标真的被删了、超出 NapCat 缓存）时，原本的
+///     论证是"窗口逐日变长，到 7 天上限被 clamp 跳过，届时自愈"——可自愈的
+///     代价是每次都要走一遍那条 clamp 告警，而它的正文说的是永久数据丢失。
+///     这个产品里最该被信任的一条告警会因此变成例行误报，等真出事的时候没人
+///     再看它。护栏让 hold 永远够不到 clamp 的触发线：顶到第六天就放手，把
+///     "这段已经反复看了六天还是看不清楚，就此放弃"这件事交回给 hold 自己
+///     那条告警（`abandonedByFloor`）说清楚，而不是伪装成一次停机 clamp。
+fn holdFloor(stored_last: ?i64, run_at: i64) i64 {
+    const clamp_floor = run_at - scheduler.max_lookback_seconds + scheduler.seconds_per_day;
+    const stored = stored_last orelse return clamp_floor;
+    return @max(clamp_floor, stored);
+}
+
+/// 一段被放弃的时间：`[from, to)` 这一段不会再被任何一轮覆盖。
+pub const Abandoned = struct { from: i64, to: i64, seconds: i64 };
+
+/// `hold` 想顶到的位置里被 `holdFloor` 挡掉、这一轮就此放弃的那一段；没被挡掉
+/// 则 null。放弃是真的放弃，所以必须有声音——这正是护栏从 clamp 那条告警手里
+/// 接过来的那件事，不能接过来就吞掉。
+fn abandonedByFloor(hold: ?i64, actual: ?i64, stored_last: ?i64) ?Abandoned {
+    const held = hold orelse return null;
+    const at = actual orelse return null;
+    // `holdFloor` 的两条下限里只有一条对应真正的放弃。撞上"回看上限前一天"
+    // 是放弃：那一段反复重扫到上限跟前还是没看清楚，就此不再看了。撞上
+    // "已经扫过的位置"（stored_last）不是：那一段本来就看过了，hold 只是想
+    // 把它再看一遍而已。不区分的话，`--last 7d` 打在任何一个健康群上、只要
+    // 有一页读不动，就会天天报一条根本没发生的数据丢失。
+    const from = if (stored_last) |stored| @max(held, stored) else held;
+    if (from >= at) return null;
+    return .{ .from = from, .to = at, .seconds = at - from };
+}
+
+/// lastrun 相对"本来打算提交的位置"退后了多少：`at` 是真正写下去的时刻，
+/// `planned` 是没出岔子时该写的。抽成函数是为了让 runOnce 那条告警不必写成
+/// 四层嵌套的 if——嵌套藏着一条容易被漏掉的行为：`planned` 为 null
+/// （本来就不许推进）时这条告警根本不打。
+pub const HeldBack = struct { at: i64, planned: i64, seconds: i64 };
+
+fn heldBack(planned: ?i64, actual: ?i64) ?HeldBack {
+    const want = planned orelse return null;
+    const at = actual orelse return null;
+    if (at >= want) return null;
+    return .{ .at = at, .planned = want, .seconds = want - at };
 }
 
 /// 两个 hold 来源合流：都为 null 才是 null，否则取更早的那个。
@@ -1215,10 +1372,10 @@ fn forcedWindowPlan(st: *store.Store, group_id: u64, run_at: i64, seconds: i64) 
             "group {d}: --last: the forced window starts at {d} but this group was only scanned up to {d} — the span [{d}, {d}) ({d}s) has NOT been examined, so lastrun is left untouched; run without --last (or with a longer duration) to actually catch up",
             .{ group_id, start, last, last, start, start - last },
         );
-        return .{ .start = start, .commit_at = null };
+        return .{ .start = start, .commit_at = null, .stored_last = last };
     }
 
-    return .{ .start = start, .commit_at = run_at };
+    return .{ .start = start, .commit_at = run_at, .stored_last = last };
 }
 
 /// 跑一次完整扫描。失败不抛出，改为在日志里发 Failed 行。
@@ -1278,21 +1435,24 @@ pub fn runOnceWithOptions(deps: Deps, run_at: i64, options: RunOptions) void {
             pushLine(a, &lines, gid, msg);
             break :catch_blk false;
         };
-        const commit_at = commitAfterHold(plan.commit_at, window_hold);
+        const commit_at = commitAfterHold(plan.commit_at, window_hold, plan.stored_last, run_at);
         // 顶住窗口这件事本身要看得见。它的代价是下一轮窗口变长；稳态窗口长度
         // 约等于（每轮顶窗口的事件数 + 1）天，撞到 4.1 节的 7 天上限才会被
         // clamp 跳过。这条 warn 就是运维判断这个数的唯一入口：偶尔一次无所谓，
         // 天天几次说明 NapCat 侧在持续吃不消，该去查那边而不是等 clamp 兜底。
         // 具体是探针失败还是引用目标解析不了，各自在发生的地方已经打过一条。
         if (ok) {
-            if (plan.commit_at) |planned| {
-                if (commit_at) |actual| {
-                    if (actual < planned) std.log.warn(
-                        "group {d}: holding lastrun at {d} instead of {d} ({d}s earlier) because something in this window could not be read; the next run rescans from there",
-                        .{ gid, actual, planned, planned - actual },
-                    );
-                }
-            }
+            if (heldBack(plan.commit_at, commit_at)) |h| std.log.warn(
+                "group {d}: holding lastrun at {d} instead of {d} ({d}s earlier) because something in this window could not be read; the next run rescans from there",
+                .{ gid, h.at, h.planned, h.seconds },
+            );
+            // 顶窗口撞上下限：这一段已经被反复重扫到了回看上限跟前还是没看
+            // 清楚，就此放弃。必须单独出声——护栏正是从 clamp 那条告警手里把
+            // 这件事接过来的（见 holdFloor），接过来就吞掉等于换了个地方静默。
+            if (abandonedByFloor(window_hold, commit_at, plan.stored_last)) |ab| std.log.warn(
+                "group {d}: giving up on the span [{d}, {d}) ({d}s): it has been held back run after run up to the {d}s lookback cap and still could not be read; anything in it that was only ever going to be seen once (💦 revocations) is now unrecoverable",
+                .{ gid, ab.from, ab.to, ab.seconds, scheduler.max_lookback_seconds },
+            );
         }
         applyLastRun(deps.st, gid, ok, commit_at);
 
@@ -1337,6 +1497,40 @@ pub fn noAdvanceOutcome(msgs: []const onebot.Message, anchor: i64) NoAdvanceOutc
     };
 }
 
+/// 一次表情探针在这条消息上认出了什么。
+///
+/// 把"认不认得这个表情"与"这个表情构成不构成收录信号"分成两件事：前者只跟
+/// emoji_id 有关，后者还要看作者在不在观察集合里。混在一起会污染
+/// `none matched star_emoji_id` 那条诊断——README 线上假设 #4 正是靠它核对
+/// ✨ 的真实 emoji_id（常量错了的话扫描器一条都收不到，现象跟"今天真的没人
+/// 贴 ✨"一模一样，不报任何错）。
+pub const ProbeMatch = struct {
+    /// 这条消息挂着 ✨（跟作者是谁无关）。
+    star: bool,
+    /// 挂着 🔥。
+    fire: bool,
+    /// 挂着 💤。
+    sleep: bool,
+    /// 这条 ✨ 构成收录信号：只有被观察成员的 ✨ 才算。
+    star_collects: bool,
+
+    /// 有没有认出任何一个已知表情。用 `star` 而不是 `star_collects`：认不
+    /// 认得 emoji_id 跟作者是谁毫无关系。
+    pub fn recognized(self: ProbeMatch) bool {
+        return self.star or self.fire or self.sleep;
+    }
+};
+
+pub fn probeMatch(data: std.json.Value, observed: bool) ProbeMatch {
+    const star = napcat.hasStarReaction(data);
+    return .{
+        .star = star,
+        .fire = napcat.hasFireReaction(data),
+        .sleep = napcat.hasSleepReaction(data),
+        .star_collects = observed and star,
+    };
+}
+
 /// 扫单个群。返回值不是错误通道——它是 runOnce 判断是否调用 setLastRun 用的
 /// 成功信号：true = 这个群从头到尾没出岔子（哪怕 Added/skipped 都是 0）；
 /// false = 落库阶段出现了至少一次 store.add 失败（已经在函数内部发了
@@ -1374,6 +1568,10 @@ fn scanGroup(
     // 真正拉到内容的页数。跟 guard 不是一回事：最后一次 fetchPage 可能什么都
     // 没拿到（翻到头了 / 响应看不懂），那一次不算一页。警告里报的是这个数。
     var pages: usize = 0;
+    // 这一轮拉到的历史里时间戳读不出来的条数。它们对这一轮完全不存在，所以
+    // 这个群不能报 `Successfully in Ns.`；累到 `Trouble.unusable_times` 上，
+    // 见那里的字段注释。
+    var unusable_times: usize = 0;
     // 这一轮允许翻多少页，按窗口跨度算（见 pageGuard）。
     const guard_max = pageGuard(win_start, win_end);
     // 循环跑满 guard_max 页而没走到任何一个 break 时留下的原因；下面每个
@@ -1396,7 +1594,7 @@ fn scanGroup(
         }
         try pool.appendSlice(a, page.msgs);
         logPage(gid, pages, page.msgs);
-        warnUnusableTimes(gid, pages, page.msgs);
+        unusable_times += warnUnusableTimes(gid, pages, page.msgs);
         pages += 1;
 
         const oldest = oldestTime(page.msgs) orelse {
@@ -1468,15 +1666,15 @@ fn scanGroup(
     defer author_cache.deinit();
 
     // ---- 3. 补拉不在池里的 reply 目标 ----
+    // pool 的 message_id 索引，下面四处"按 id 在 pool 里找"共用它，见 PoolIndex
+    // 的说明。pool 在这一步里还会继续追加，所以每次 append 都要跟着 add。
+    var pool_index: PoolIndex = .{};
+    defer pool_index.deinit(a);
+    for (pool.items, 0..) |m, i| try pool_index.add(a, m.message_id, i);
+
     for (window.items) |m| {
         const rid = m.replyTarget() orelse continue;
-        var target: ?onebot.Message = null;
-        for (pool.items) |p| {
-            if (p.message_id == rid) {
-                target = p;
-                break;
-            }
-        }
+        var target: ?onebot.Message = pool_index.lookup(pool.items, rid);
         if (target == null) {
             // 拉不到就静默跳过：这里对窗口内每条带 reply 段的消息都会尝试解析，
             // 绝大多数是普通聊天回复，从来用不上；真正被 classify 需要却解析不了
@@ -1484,6 +1682,7 @@ fn scanGroup(
             // 不在这里重复发一遍。
             const data = getMsg(deps, a, rid, &get_msg_stats) orelse continue;
             target = (try onebot.parseMessage(a, data)) orelse continue;
+            try pool_index.add(a, target.?.message_id, pool.items.len);
             try pool.append(a, target.?);
         }
 
@@ -1500,16 +1699,12 @@ fn scanGroup(
         // reply 外只有一个 `✨` 文本段；路径3b要求管理员的 `✨ @某人`。
         // 普通的"回复一条回复"完全不满足，不会多花任何一次 get_msg。
         const hop = rules.triggerTarget(target.?, rule_params) orelse continue;
-        var have_hop = false;
-        for (pool.items) |p| {
-            if (p.message_id == hop) {
-                have_hop = true;
-                break;
-            }
-        }
-        if (have_hop) continue;
+        if (pool_index.index(hop) != null) continue;
         const hop_data = getMsg(deps, a, hop, &get_msg_stats) orelse continue;
-        if (try onebot.parseMessage(a, hop_data)) |parsed| try pool.append(a, parsed);
+        if (try onebot.parseMessage(a, hop_data)) |parsed| {
+            try pool_index.add(a, parsed.message_id, pool.items.len);
+            try pool.append(a, parsed);
+        }
     }
 
     // pool 现在已经包含窗口消息及所有成功回补的 reply 目标。先在 pool 上补齐
@@ -1518,12 +1713,8 @@ fn scanGroup(
     // 普通候选的 renderText 调用点才补。
     try resolveAtNames(deps, a, gid, pool.items, &author_cache);
     for (window.items) |*message| {
-        for (pool.items) |pooled| {
-            if (pooled.message_id == message.message_id) {
-                message.segments = pooled.segments;
-                break;
-            }
-        }
+        const pooled = pool_index.lookup(pool.items, message.message_id) orelse continue;
+        message.segments = pooled.segments;
     }
 
     // ---- 4. 查表情回应（✨/🔥 共用 get_msg；管理员的单独 💤 也必须探测）----
@@ -1567,10 +1758,10 @@ fn scanGroup(
         // 只在"紧跟一条 🔥 之后"才多探一次，而不是无差别探整个窗口：额外开销
         // 因此正比于真实的链延续尝试次数（连续几座桥会一座接一座地把条件传下去），
         // 而不是群里的聊天总量。生产上一个窗口 2300 次探针，无差别探会翻好几倍。
-        if (!observed and !sleep_anchor and !prev_has_fire) {
-            prev_has_fire = false;
-            continue;
-        }
+        // 这一条是因为"上一条带着 🔥"才被探的？下面 getMsg 失败时要用，所以
+        // 必须在 prev_has_fire 被重置之前留一份。
+        const bridge_candidate = prev_has_fire;
+        if (!observed and !sleep_anchor and !bridge_candidate) continue;
         probed_count += 1;
         prev_has_fire = false;
         // 上一条探针的回复在这里作废。下面这一段（含 sleepReactionConfirmed
@@ -1586,28 +1777,34 @@ fn scanGroup(
             // 而窗口一旦滑过去这条语录就永远不会再被看到。记下最早的一条，
             // 让 commitAfterHold 把 lastrun 顶在它前面——下一轮连同它的
             // 邻居一起重扫，🔥 链与 💨 补丁的判定才有完整上下文。
-            // 只探 💤 的非观察成员不参与顶窗口，理由见上一段。
-            if (observed) window_hold.* = mergeHold(window_hold.*, m.time);
+            //
+            // 桥（`bridge_candidate`）同享这条规则，哪怕它的作者不在观察集合
+            // 里：探不到就不知道它带没带 🔥，buildChains 会在它这里断开，一条
+            // 链当场碎成两条独立语录**各自入库**——下一轮 exists/isChainMember
+            // 会把它们挡住，这条链永远合不回来了。design.md §4.4 说桥可以是
+            // 任何人发的，那么"桥没看清楚"就和"被观察者没看清楚"一样是不可
+            // 恢复的，不能因为作者不在集合里就把这次抖动咽下去。
+            //
+            // 只探 💤 的非观察成员仍然不参与顶窗口，理由见上一段：那条命令
+            // 探不到就只是一句普通聊天，没有任何东西会因此永久丢失。
+            if (observed or bridge_candidate) window_hold.* = mergeHold(window_hold.*, m.time);
             continue;
         };
-        var matched = false;
-        // ✨ 只对被观察者有意义：它是"这句话值得收录"的标记，而非观察成员的
-        // 消息不该因为被点了 ✨ 就变成一条语录（isChainContent 与路径1都另外
-        // 查了作者，这里不放进 star_ids 是把这条约束提前到探针层，省得下游
-        // 每处都要重判一遍）。
-        if (observed and napcat.hasStarReaction(data)) {
+        const match = probeMatch(data, observed);
+        // ✨ 只对被观察者构成收录信号：它是"这句话值得收录"的标记，而非观察
+        // 成员的消息不该因为被点了 ✨ 就变成一条语录（isChainContent 与路径1
+        // 都另外查了作者，这里不放进 star_ids 是把这条约束提前到探针层，省得
+        // 下游每处都要重判一遍）。
+        if (match.star_collects) {
             try star_ids.append(a, m.message_id);
-            matched = true;
         }
         // 🔥 相反，是**作者无关**的：carriesFire 只问"这条消息带没带 🔥"，
         // 内容成员的作者要求由 isChainContent 单独把关。桥正是靠这一条成立的。
-        if (napcat.hasFireReaction(data)) {
+        if (match.fire) {
             try fire_ids.append(a, m.message_id);
             prev_has_fire = true;
-            matched = true;
         }
-        if (napcat.hasSleepReaction(data)) {
-            matched = true;
+        if (match.sleep) {
             if (sleep_anchor) {
                 if (try sleepReactionConfirmed(deps, pa, gid, m.message_id, m.user_id)) {
                     try sleep_reaction_ids.append(a, m.message_id);
@@ -1619,7 +1816,7 @@ fn scanGroup(
                 }
             }
         }
-        if (matched) continue;
+        if (match.recognized()) continue;
         // design.md §3.3 要求把未匹配的 emoji_id 打进日志，README 线上假设 #4
         // 靠它核对 ✨ 的真实 emoji_id：这个常量要是错了，扫描器一条都收不到，
         // 现象跟"今天真的没人贴 ✨"一模一样，不会报任何错。只在这条消息确实有
@@ -1667,12 +1864,12 @@ fn scanGroup(
     // warn、lastrun 照常前移，下一轮窗口从它后面开始，这条撤稿指令就此永久
     // 蒸发，一句本该下架的话继续挂在公开 API 上。顶住之后下一轮会把这条指令
     // 连同它的上下文重新盖一遍，NapCat 的瞬时抖动因此只是推迟、不是丢失。
-    if (unresolvedHold(window.items, pool.items, outcome.unresolved, rule_params)) |at| {
+    if (unresolvedHold(window.items, pool.items, pool_index, outcome.unresolved, rule_params)) |at| {
         window_hold.* = mergeHold(window_hold.*, at);
     }
 
     // ---- 6. 作废先落盘 ----
-    var trouble: Trouble = .{};
+    var trouble: Trouble = .{ .unusable_times = unusable_times };
     for (outcome.revoked) |rid| {
         deps.st.revoke(rid) catch |e| {
             // 作废失败必须跟入库失败一样压掉 Successfully in Ns. 与 setLastRun。
@@ -1933,11 +2130,14 @@ fn scanGroup(
 
     // 出过岔子就不能用 Successfully in Ns. 收尾——那是运营方唯一的"这次跑成功了"信号。
     // 改发 Failed 行，带上各类失败的条数与最后一次的错误原因。
-    if (trouble.any()) {
+    if (trouble.reportable()) {
         const reason = try troubleReason(a, trouble);
         const msg = try failedLine(a, reason);
         pushLine(a, lines, gid, msg);
-        return false;
+        // 返回值是"能不能推进 lastrun"，跟"第七行说什么"是两件事：坏时间戳
+        // 改口但不压 lastrun（重扫改变不了它，压住就是永久卡死），其余三类
+        // 两样都做。见 Trouble.unusable_times 的字段注释。
+        return !trouble.any();
     }
 
     const elapsed_s = deps.clock() - started_at;
@@ -2218,14 +2418,14 @@ test "pageStopReason 区分「翻到头了」与「响应看不懂」" {
     // 正常页：能继续翻
     try std.testing.expectEqual(
         @as(?PageStop, null),
-        pageStopReason(try jsonVal(a, "{\"messages\":[{}]}"), 1),
+        pageStopReason(try jsonVal(a, "{\"messages\":[{}]}"), 1, false),
     );
 
     // 空数组 = 群历史到头了，属于正常收尾。reached_start 必须为 true：
     // 再往前**没有**消息了，这一轮的窗口是被完整覆盖过的。判成 false 的话
     // 每个历史比窗口还短的小群都会天天挨一条"NOT fully covered"的假警报，
     // 而且下面那条顶住 lastrun 的规则会把它永久钉在原地。
-    const empty = pageStopReason(try jsonVal(a, "{\"messages\":[]}"), 0).?;
+    const empty = pageStopReason(try jsonVal(a, "{\"messages\":[]}"), 0, false).?;
     try std.testing.expectEqualStrings("empty page (reached the start of the group's history)", empty.reason);
     try std.testing.expectEqual(true, empty.reached_start);
 
@@ -2238,10 +2438,32 @@ test "pageStopReason 区分「翻到头了」与「响应看不懂」" {
         .{ .src = "{\"messages\":\"nope\"}", .reason = "get_group_msg_history messages field is not an array" },
     };
     for (cases) |c| {
-        const got = pageStopReason(try jsonVal(a, c.src), 0).?;
+        const got = pageStopReason(try jsonVal(a, c.src), 0, false).?;
         try std.testing.expectEqualStrings(c.reason, got.reason);
         try std.testing.expectEqual(false, got.reached_start);
     }
+}
+
+test "pageStopReason：第一页就空不算翻到了群历史开头——这一轮一条消息都没看到" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // 翻页途中（已经拿到过至少一页）的空页仍然是正常收尾：往前确实没有更老的
+    // 消息了，窗口被完整覆盖过。
+    const later = pageStopReason(try jsonVal(a, "{\"messages\":[]}"), 0, false).?;
+    try std.testing.expectEqual(true, later.reached_start);
+
+    // 但**第一页**就空是另一回事：这一轮一条消息都没拿到，"这个群真的一条
+    // 消息都没有" 跟 "NapCat 限流/抖动回了个空数组" 在这里长得一模一样。
+    // 判成"翻到头了"的话，整个窗口连同其中只会被看到一次的 💦 会被安静地
+    // 宣布为已扫过——正是这套代码反复在防的那种静默数据丢失。
+    const first = pageStopReason(try jsonVal(a, "{\"messages\":[]}"), 0, true).?;
+    try std.testing.expectEqual(false, first.reached_start);
+    try std.testing.expectEqualStrings(
+        "empty first page (no history at all — cannot tell an empty group from a throttled reply)",
+        first.reason,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2438,6 +2660,29 @@ test "oldestId：翻页锚点同样跳过时间戳不可用的消息" {
     try std.testing.expectEqual(@as(?i64, null), oldestId(&all_bad));
 }
 
+test "pageBounds：时间戳不可用的消息不当这一页的最老/最新，跟翻页锚点保持同一条" {
+    const msgs = [_]onebot.Message{
+        .{ .message_id = 7, .user_id = 1, .time = 0, .segments = &.{} },
+        .{ .message_id = 8, .user_id = 1, .time = 1_700_000_100, .segments = &.{} },
+        .{ .message_id = 9, .user_id = 1, .time = 1_700_000_200, .segments = &.{} },
+    };
+    const bounds = pageBounds(&msgs).?;
+
+    // 报出来的最老必须就是翻页真正锚定的那条，否则 README 靠这行日志核对
+    // 的两条线上假设（#1/#2 比相邻两页的首尾）恰好会在坏时间戳出现的那些页
+    // 上说谎——而那正是 warnUnusableTimes 在报警的那些页。
+    try std.testing.expectEqual(oldestId(&msgs).?, bounds.oldest.message_id);
+    try std.testing.expectEqual(oldestTime(&msgs).?, bounds.oldest.time);
+    try std.testing.expectEqual(@as(i64, 8), bounds.oldest.message_id);
+    try std.testing.expectEqual(@as(i64, 9), bounds.newest.message_id);
+
+    // 整页都不可用时没有可报的边界。
+    const all_bad = [_]onebot.Message{
+        .{ .message_id = 1, .user_id = 1, .time = 0, .segments = &.{} },
+    };
+    try std.testing.expectEqual(@as(?PageBounds, null), pageBounds(&all_bad));
+}
+
 test "oldestId 时间并列时按 message_id 取最小者，与输入顺序无关" {
     const a_first = [_]onebot.Message{
         .{ .message_id = 5, .user_id = 1, .time = 100, .segments = &.{} },
@@ -2567,6 +2812,31 @@ test "pageGuard：封顶在 7 天对应的页数，荒谬的窗口跨度也不�
 // reverse_order 改成 true 之前，锚点没前进只可能是后一种；改完之后闭区间锚点
 // 让前一种变得可达，这里锁死两条分支各自的 reached_start 与 stop_reason，
 // 不满足于只断言其中一个字段——那样挡不住"该 true 却传了 false"或反过来。
+
+test "probeMatch：认不认得表情跟作者在不在观察集合里无关" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const star_only = try jsonVal(a, "{\"emoji_likes_list\":[{\"emoji_id\":\"10024\",\"likes_cnt\":1}]}");
+
+    // 被观察成员：✨ 既被认出，也构成收录信号。
+    const observed = probeMatch(star_only, true);
+    try std.testing.expect(observed.star);
+    try std.testing.expect(observed.star_collects);
+    try std.testing.expect(observed.recognized());
+
+    // 非观察成员（比如一座桥）：✨ 不构成收录信号——这条约束不变。
+    const outsider = probeMatch(star_only, false);
+    try std.testing.expect(outsider.star);
+    try std.testing.expect(!outsider.star_collects);
+    // 但它**被认出来了**。判成"一个都没认出来"会让 scanGroup 打出
+    // "message N carries emoji reactions but none matched star_emoji_id=10024 ... : 10024"
+    // ——README 线上假设 #4 拿这条日志判断 star_emoji_id 常量对不对，而这里
+    // 的 ✨ 完全正确，只是作者不在观察集合里。这条诊断一旦开始误报，真正
+    // 配错 emoji_id 的那天就没人会信它了。
+    try std.testing.expect(outsider.recognized());
+}
 
 test "noAdvanceOutcome：页面只有锚点自己一条 → 判定为翻到历史开头，reached_start=true" {
     const anchor_id: i64 = 555;
@@ -2785,6 +3055,39 @@ fn holdTextMsg(comptime id: i64, comptime uid: u64, comptime at: i64, comptime t
     };
 }
 
+test "PoolIndex：按 message_id 定位，重复的 id 保留第一份" {
+    const gpa = std.testing.allocator;
+    // 闭区间翻页会让锚点消息重复出现在下一页里，于是 pool 里同一个
+    // message_id 有两份。改成索引之前，四处线性扫描全都是"撞上第一份就
+    // break"，这个取法必须一字不差地保住——第二份是下一页里那条已经被
+    // resolveAtNames 处理过/没处理过的另一个拷贝，换一份就换了 segments。
+    const pool = [_]onebot.Message{
+        .{ .message_id = 7, .user_id = 1, .time = 100, .segments = &.{} },
+        .{ .message_id = 8, .user_id = 2, .time = 200, .segments = &.{} },
+        .{ .message_id = 7, .user_id = 3, .time = 300, .segments = &.{} },
+    };
+
+    var idx: PoolIndex = .{};
+    defer idx.deinit(gpa);
+    for (pool, 0..) |m, i| try idx.add(gpa, m.message_id, i);
+
+    try std.testing.expectEqual(@as(?usize, 0), idx.index(7));
+    try std.testing.expectEqual(@as(?usize, 1), idx.index(8));
+    try std.testing.expectEqual(@as(?usize, null), idx.index(999));
+
+    try std.testing.expectEqual(@as(u64, 1), idx.lookup(&pool, 7).?.user_id);
+    try std.testing.expectEqual(@as(?onebot.Message, null), idx.lookup(&pool, 999));
+}
+
+/// unresolvedHold 的测试要一份 pool 索引。生产里它由 scanGroup 在补拉 reply
+/// 目标时边追加边维护；测试里 pool 是现成的，直接整份建一次。
+fn testPoolIndex(a: std.mem.Allocator, pool: []const onebot.Message) !PoolIndex {
+    var idx: PoolIndex = .{};
+    errdefer idx.deinit(a);
+    for (pool, 0..) |m, i| try idx.add(a, m.message_id, i);
+    return idx;
+}
+
 test "unresolvedHold：💦 的目标解析不了时，顶在那条 💦 自己的时刻上" {
     const p: rules.Params = .{ .observed_qqs = &.{10001}, .admin_qqs = &.{20001} };
     const window = [_]onebot.Message{
@@ -2794,9 +3097,11 @@ test "unresolvedHold：💦 的目标解析不了时，顶在那条 💦 自己�
     // 999 既不在窗口里也没能靠 get_msg 回补 → classify 记进 unresolved。
     // 顶在 💦 那条（1_700_000_500）而不是 999：999 的时刻无从得知，而下一轮
     // 只要窗口重新盖住这条 💦，撤稿就会被原样重放一次。
+    var idx = try testPoolIndex(std.testing.allocator, &window);
+    defer idx.deinit(std.testing.allocator);
     try std.testing.expectEqual(
         @as(?i64, 1_700_000_500),
-        unresolvedHold(&window, &window, &.{999}, p),
+        unresolvedHold(&window, &window, idx, &.{999}, p),
     );
 }
 
@@ -2809,9 +3114,11 @@ test "unresolvedHold：一跳落空时顶在窗口里那条 💦 上——中间
     const trigger = holdReplyMsg(2, 30001, 1_699_000_000, 999, "✨");
     const window = [_]onebot.Message{holdReplyMsg(3, 20001, 1_700_000_900, 2, "💦")};
     const pool = [_]onebot.Message{ trigger, window[0] };
+    var idx = try testPoolIndex(std.testing.allocator, &pool);
+    defer idx.deinit(std.testing.allocator);
     try std.testing.expectEqual(
         @as(?i64, 1_700_000_900),
-        unresolvedHold(&window, &pool, &.{999}, p),
+        unresolvedHold(&window, &pool, idx, &.{999}, p),
     );
 }
 
@@ -2821,10 +3128,12 @@ test "unresolvedHold：没有解析不了的目标时不顶窗口；多条时取
         holdReplyMsg(2, 20001, 1_700_000_800, 998, "💦"),
         holdReplyMsg(3, 20001, 1_700_000_300, 999, "💦"),
     };
-    try std.testing.expectEqual(@as(?i64, null), unresolvedHold(&window, &window, &.{}, p));
+    var idx = try testPoolIndex(std.testing.allocator, &window);
+    defer idx.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?i64, null), unresolvedHold(&window, &window, idx, &.{}, p));
     try std.testing.expectEqual(
         @as(?i64, 1_700_000_300),
-        unresolvedHold(&window, &window, &.{ 998, 999 }, p),
+        unresolvedHold(&window, &window, idx, &.{ 998, 999 }, p),
     );
 }
 
@@ -2833,19 +3142,101 @@ test "commitAfterHold：探针失败时把 lastrun 顶在最早那条失败消�
     const failed_at: i64 = run_at - 7200;
 
     // 没有探针失败：照常推进到 run_at。
-    try std.testing.expectEqual(@as(?i64, run_at), commitAfterHold(run_at, null));
+    try std.testing.expectEqual(@as(?i64, run_at), commitAfterHold(run_at, null, null, run_at));
 
     // 有探针失败：只能推进到那条消息的时刻——它的 ✨ 这一轮没被看到，
     // 窗口必须留着它，下一轮才能连同它的邻居一起重新覆盖（🔥 链与 💨
     // 补丁的判定都依赖邻居，所以顶住窗口比单独重探那一条更正确）。
-    try std.testing.expectEqual(@as(?i64, failed_at), commitAfterHold(run_at, failed_at));
+    try std.testing.expectEqual(@as(?i64, failed_at), commitAfterHold(run_at, failed_at, null, run_at));
 
     // 本来就不许推进（--last 接不上、getLastRun 读失败）时，探针失败改变不了结论。
-    try std.testing.expectEqual(@as(?i64, null), commitAfterHold(null, failed_at));
-    try std.testing.expectEqual(@as(?i64, null), commitAfterHold(null, null));
+    try std.testing.expectEqual(@as(?i64, null), commitAfterHold(null, failed_at, null, run_at));
+    try std.testing.expectEqual(@as(?i64, null), commitAfterHold(null, null, null, run_at));
 
     // 失败的消息比 run_at 还新（时钟漂移之类）：取较小者，绝不倒退成前移。
-    try std.testing.expectEqual(@as(?i64, run_at), commitAfterHold(run_at, run_at + 500));
+    try std.testing.expectEqual(@as(?i64, run_at), commitAfterHold(run_at, run_at + 500, null, run_at));
+}
+
+test "commitAfterHold：顶窗口绝不把 lastrun 倒退到已经扫过的位置之前" {
+    const run_at: i64 = 1_700_100_000;
+    // 这个群其实只落后一小时，是健康的。
+    const stored: i64 = run_at - 3600;
+    // 但 `hikari run --last 7d` 把窗口起点强拉到 7 天前，只要有一页读不动，
+    // hold 就落在那里。没有下限护栏的话 @min 会把 lastrun 整整回拨 7 天：
+    // 下一轮 run_at' - lastrun 超过回看上限 → clamp → 报一条"这段永远不会被
+    // 重扫、里面的 💦 不可恢复"——而那一段其实早就扫过了。这个产品里最重要
+    // 的那条告警会因此变成例行误报。
+    const hold: i64 = run_at - 7 * scheduler.seconds_per_day;
+    try std.testing.expectEqual(@as(?i64, stored), commitAfterHold(run_at, hold, stored, run_at));
+
+    // 下限只挡"倒退"，不影响正常的顶窗口：hold 落在 stored 之后时原样生效。
+    const in_window: i64 = run_at - 1800;
+    try std.testing.expectEqual(@as(?i64, in_window), commitAfterHold(run_at, in_window, stored, run_at));
+}
+
+test "commitAfterHold：hold 顶不过回看上限——一件永远看不清楚的事不会把 clamp 告警变成例行误报" {
+    const run_at: i64 = 1_700_100_000;
+    // 某个引用目标是真的被删了，每一轮 unresolvedHold 都顶在同一条 💦 上。
+    // 顶到第七天，run_at - hold 就要越过 7 天回看上限，下一轮 windowStart
+    // 会 clamp 并打那条"永久不可恢复"的告警——可这段每一轮都实实在在扫过。
+    // 护栏：hold 最多把 lastrun 顶到"回看上限前一天"，再往前就放手。
+    const floor = run_at - scheduler.max_lookback_seconds + scheduler.seconds_per_day;
+    const ancient: i64 = run_at - scheduler.max_lookback_seconds - 10 * scheduler.seconds_per_day;
+    try std.testing.expectEqual(@as(?i64, floor), commitAfterHold(run_at, ancient, null, run_at));
+
+    // 护栏内的 hold 一个字都不改。
+    const recent: i64 = run_at - 2 * scheduler.seconds_per_day;
+    try std.testing.expectEqual(@as(?i64, recent), commitAfterHold(run_at, recent, null, run_at));
+}
+
+test "heldBack：只在真的退后时出声，本来就不许推进时不出声" {
+    const run_at: i64 = 1_700_100_000;
+    try std.testing.expectEqual(@as(?HeldBack, null), heldBack(run_at, run_at));
+    // 本来就不许推进（--last 接不上、getLastRun 读失败）：没有"退后"可言，
+    // 这条告警不该打——四层嵌套 if 把这条行为藏得很深，这里把它钉住。
+    try std.testing.expectEqual(@as(?HeldBack, null), heldBack(null, run_at - 500));
+    try std.testing.expectEqual(@as(?HeldBack, null), heldBack(run_at, null));
+
+    const got = heldBack(run_at, run_at - 500).?;
+    try std.testing.expectEqual(@as(i64, run_at - 500), got.at);
+    try std.testing.expectEqual(@as(i64, run_at), got.planned);
+    try std.testing.expectEqual(@as(i64, 500), got.seconds);
+}
+
+test "abandonedByFloor：hold 被下限挡掉时报出被放弃的那一段" {
+    const run_at: i64 = 1_700_100_000;
+    // hold 落在下限之内：什么都没放弃。
+    try std.testing.expectEqual(@as(?Abandoned, null), abandonedByFloor(run_at - 500, run_at - 500, null));
+    try std.testing.expectEqual(@as(?Abandoned, null), abandonedByFloor(null, run_at, null));
+    try std.testing.expectEqual(@as(?Abandoned, null), abandonedByFloor(run_at - 500, null, null));
+
+    // hold 想顶到 10 天前，实际只写到 6 天前：中间那 4 天就此放弃。
+    const wanted: i64 = run_at - 10 * scheduler.seconds_per_day;
+    const written: i64 = run_at - 6 * scheduler.seconds_per_day;
+    const got = abandonedByFloor(wanted, written, null).?;
+    try std.testing.expectEqual(wanted, got.from);
+    try std.testing.expectEqual(written, got.to);
+    try std.testing.expectEqual(@as(i64, 4 * scheduler.seconds_per_day), got.seconds);
+
+    // 被"已经扫过的位置"这条下限挡回去时**什么都没被放弃**：hold 想顶到的
+    // 那一段整个落在 stored_last 之前，也就是早就看过了。这里要是照样喊
+    // "giving up on the span ... unrecoverable"，`--last 7d` 打在任何一个
+    // 健康群上、只要有一页读不动，就会天天报一条根本没发生的数据丢失。
+    const stored: i64 = run_at - 3600;
+    try std.testing.expectEqual(
+        @as(?Abandoned, null),
+        abandonedByFloor(run_at - 7 * scheduler.seconds_per_day, stored, stored),
+    );
+
+    // 只有越过 stored_last 的那一段才算放弃。
+    const partial = abandonedByFloor(
+        run_at - 10 * scheduler.seconds_per_day,
+        written,
+        run_at - 8 * scheduler.seconds_per_day,
+    ).?;
+    try std.testing.expectEqual(run_at - 8 * scheduler.seconds_per_day, partial.from);
+    try std.testing.expectEqual(written, partial.to);
+    try std.testing.expectEqual(@as(i64, 2 * scheduler.seconds_per_day), partial.seconds);
 }
 
 test "resolveWindowStart：getLastRun 读失败时不许推进 lastrun，否则一次读抖动会留下永久空洞" {
@@ -2893,9 +3284,14 @@ test "resolveWindowStart：停机超过 7 天上限 → 截断到上限（clampe
 test "resolveWindowStart：--last 的窗口起点完全由参数决定，存量 lastrun 不参与" {
     const gpa = std.testing.allocator;
     const run_at: i64 = 1_700_100_000;
-    // 空脚本：连 lastrun 都读不出来（EndOfStream），窗口起点依然是参数算的那个。
-    // 读 lastrun 只用来判断"能不能推进"，从不参与窗口大小。
-    const srv = try FakeServer.start(gpa, "");
+    const forced: i64 = 3 * 3600;
+
+    // 两次 GET：先给一个远早于强制窗口的 lastrun（10 天前），再给一个远晚于
+    // 它的（60 秒前）。两者都**读得到**——这一点很重要：拿空脚本让 getLastRun
+    // 直接失败的话，forcedWindowPlan 在比较 last 与 start 之前就早退了，
+    // 这个测试就再也测不到它名字声称的东西（"存量 lastrun 不参与窗口大小"），
+    // 一个让 start 跟着成功读到的 last 走的回归照样能过。
+    const srv = try FakeServer.start(gpa, "$10\r\n1699236000\r\n$10\r\n1700099940\r\n");
     defer {
         srv.stop();
         srv.received.deinit(gpa);
@@ -2904,7 +3300,17 @@ test "resolveWindowStart：--last 的窗口起点完全由参数决定，存量 
     var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
     var st = store.Store.init(gpa, &c);
 
-    try std.testing.expectEqual(run_at - 3 * 3600, resolveWindowStart(&st, 100, run_at, 3 * 3600).start);
+    // 存量落后 10 天：窗口起点仍然只由 --last 决定，绝不因此变成 10 天。
+    const behind = resolveWindowStart(&st, 100, run_at, forced);
+    try std.testing.expectEqual(run_at - forced, behind.start);
+    // 而 lastrun 确实被读了、也确实参与了"能不能推进"的判断——commit_at 为
+    // null 正是那次比较的结果，也是这次读没有走失败早退路径的证据。
+    try std.testing.expectEqual(@as(?i64, null), behind.commit_at);
+
+    // 存量只落后 60 秒：窗口起点还是同一个，不会缩成 60 秒。
+    const caught_up = resolveWindowStart(&st, 100, run_at, forced);
+    try std.testing.expectEqual(run_at - forced, caught_up.start);
+    try std.testing.expectEqual(@as(?i64, run_at), caught_up.commit_at);
 
     c.deinit();
     srv.stop();
@@ -3792,6 +4198,76 @@ fn stubClock() i64 {
     return stub_clock_values[idx];
 }
 
+test "runOnce：窗口里有时间戳读不出来的消息时不报 Successfully，但 lastrun 照常前移" {
+    const gpa = std.testing.allocator;
+    const run_at: i64 = 1_700_100_000;
+
+    // GET lastrun(nil) → SET groupname → SET lastrun，多给几条 +OK 富余。
+    const redis_srv = try FakeServer.start(gpa, "$-1\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n");
+    defer {
+        redis_srv.stop();
+        redis_srv.received.deinit(gpa);
+        gpa.destroy(redis_srv);
+    }
+
+    // 第一页里 message_id=2 的 time 缺失 → parseMessage 填 0 → hasUsableTime
+    // 判假 → 它既进不了判定窗口（inWindow(0, ...) 恒假）也不参与翻页锚点。
+    // 也就是说这一轮**它对扫描器完全不存在**：如果它恰好是一条 💦，那条撤稿
+    // 指令就这么没了，而群里照报 Successfully in Ns.。
+    //
+    // 顶住 lastrun 不是解法——下一轮同一条消息还是同样的坏时间戳，只会把这个
+    // 群永久卡在原地。要修的是那句"这一轮一切正常"的结论本身。
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"user_id\":2131597992,\"nickname\":\"A2Bot\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[" ++
+            "{\"message_id\":1,\"user_id\":10001,\"time\":1700050000,\"message\":[{\"type\":\"text\",\"data\":{\"text\":\"正常的一句\"}}]}," ++
+            "{\"message_id\":2,\"user_id\":10001,\"message\":[{\"type\":\"text\",\"data\":{\"text\":\"时间戳读不出来的一句\"}}]}" ++
+            "]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"emoji_likes_list\":[]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"group_name\":\"测试群\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"message_id\":1,\"res_id\":\"x\",\"forward_id\":\"x\"}}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+
+    var rc = try redis.Client.connect(gpa, "127.0.0.1", redis_srv.port(), null, 0);
+    var st = store.Store.init(gpa, &rc);
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+
+    const deps: Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = &st,
+        .observed_qqs = &.{10001},
+        .admin_qqs = &.{},
+        .group_ids = &.{77},
+    };
+
+    runOnce(deps, run_at);
+
+    rc.deinit();
+    redis_srv.stop();
+    nap_srv.stop();
+
+    const forward = nap_srv.bodies.items[nap_srv.bodies.items.len - 1];
+    // 第七行必须说明这一轮没能完整评估这个窗口，而不是宣布成功。
+    try std.testing.expect(std.mem.indexOf(u8, forward, "Successfully in") == null);
+    try std.testing.expect(std.mem.indexOf(u8, forward, "1 message(s) had no usable timestamp and could not be evaluated") != null);
+
+    // 但 lastrun 照常前移：重扫改变不了这条消息的时间戳，顶住只会让这个群
+    // 永远卡在同一条坏消息上，把一次性的坏数据变成自我持续的死锁。
+    const expected = try resp.encodeCommand(gpa, &.{ "SET", "hikari:lastrun:77", "1700100000" });
+    defer gpa.free(expected);
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, expected) != null);
+}
+
 test "runOnce：正常收尾（没有 Trouble）时第七个 node 是 Successfully in Ns.，耗时由注入的 clock 决定" {
     const gpa = std.testing.allocator;
     const run_at: i64 = 1_700_100_000;
@@ -4204,6 +4680,85 @@ test "runOnce：🔥 桥由非观察成员发出时链仍要跨过去——探�
     try std.testing.expect(std.mem.indexOf(u8, forward, "Will process 3 messages.") != null);
     // 一条语录，不是两条碎句——桥的"哈哈哈"也没混进正文。
     try std.testing.expect(std.mem.indexOf(u8, forward, "Added 1 messages, skipped 0 messages (existing 0, tombstoned 0, chain member 0, target missing 0, empty 0).") != null);
+}
+
+test "runOnce：桥的探针失败时同样顶住 lastrun——否则一条 🔥 链被永久劈成两段" {
+    const gpa = std.testing.allocator;
+    const run_at: i64 = 1_700_100_000;
+    // 桥（message_id=2，非观察成员）自己的时刻：hold 必须顶在这里。
+    const bridge_time: i64 = 1_700_050_001;
+
+    // GET lastrun(nil) → SET groupname → SET lastrun，多给几条 +OK 富余。
+    const redis_srv = try FakeServer.start(gpa, "$-1\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n");
+    defer {
+        redis_srv.stop();
+        redis_srv.received.deinit(gpa);
+        gpa.destroy(redis_srv);
+    }
+
+    // 1 带 🔥 → 2 因此被当成桥探一次 → 两次 get_msg 都失败。
+    //
+    // 旧行为：探针失败的顶窗口只盖 `observed`，桥不在观察集合里，于是这条
+    // 抖动被完全咽下——2 进不了 fire_ids，buildChains 在它这里断开，1 和 3
+    // 变成两条独立语录并各自入库；lastrun 照常推到 run_at，下一轮
+    // exists/isChainMember 会把它们挡住，这条链**永远**合不回来了。探针的
+    // 顶窗口机制正是为这种"窗口一滑过去就再没机会"的情形准备的，桥必须同享。
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"user_id\":2131597992,\"nickname\":\"A2Bot\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[" ++
+            "{\"message_id\":1,\"user_id\":10001,\"time\":1700050000,\"message\":[{\"type\":\"text\",\"data\":{\"text\":\"你们有钱\"}}]}," ++
+            "{\"message_id\":2,\"user_id\":99999,\"time\":1700050001,\"message\":[{\"type\":\"text\",\"data\":{\"text\":\"哈哈哈\"}}]}," ++
+            "{\"message_id\":3,\"user_id\":10001,\"time\":1700050002,\"message\":[{\"type\":\"text\",\"data\":{\"text\":\"你们潇洒\"}}]}" ++
+            "]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[]}}",
+        // 1：只有 🔥，没有 ✨——不产生候选，这一轮不碰入库路径。
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"emoji_likes_list\":[{\"emoji_id\":\"128293\",\"likes_cnt\":1}]}}",
+        // 2（桥）：两次都失败。
+        "{\"status\":\"failed\",\"retcode\":1404,\"data\":null}",
+        "{\"status\":\"failed\",\"retcode\":1404,\"data\":null}",
+        // 3：照常探到。
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"emoji_likes_list\":[{\"emoji_id\":\"128293\",\"likes_cnt\":1}]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"group_name\":\"测试群\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"message_id\":1,\"res_id\":\"x\",\"forward_id\":\"x\"}}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+
+    var rc = try redis.Client.connect(gpa, "127.0.0.1", redis_srv.port(), null, 0);
+    var st = store.Store.init(gpa, &rc);
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+
+    const deps: Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = &st,
+        .observed_qqs = &.{10001},
+        .admin_qqs = &.{},
+        .group_ids = &.{78},
+        .get_msg_retry_delay_ns = 0,
+    };
+
+    runOnce(deps, run_at);
+
+    rc.deinit();
+    redis_srv.stop();
+    nap_srv.stop();
+
+    const held = try std.fmt.allocPrint(gpa, "{d}", .{bridge_time});
+    defer gpa.free(held);
+    const expected = try resp.encodeCommand(gpa, &.{ "SET", "hikari:lastrun:78", held });
+    defer gpa.free(expected);
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, expected) != null);
+
+    const wrong = try resp.encodeCommand(gpa, &.{ "SET", "hikari:lastrun:78", "1700100000" });
+    defer gpa.free(wrong);
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, wrong) == null);
 }
 
 test "runOnce：isChainMember 拦下一个已属于其它链的候选——即便它这次单独满足路径1格式" {
