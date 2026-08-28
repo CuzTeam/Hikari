@@ -32,8 +32,12 @@ pub fn nextRunAt(now: i64, hour: u8, minute: u8, offset: i64) i64 {
 pub const Window = struct { start: i64, clamped: bool };
 
 /// 回看上限：停机超过这个时长，更早的那段放弃并警告。
-/// 7 天 ≈ 35 页（200 条/页），远在 runner 的 200 次迭代护栏内。
-pub const max_lookback_seconds: i64 = 7 * 86400;
+///
+/// 翻页量由 `runner.pageGuard` 按窗口跨度算，不是一个固定的迭代数：日均
+/// 5700 条以上的群光是 24 小时窗口就能填满 200 页，7 天窗口最多要到
+/// `runner.page_guard_max`（= 7 × 200）页。这个常量同时是那条护栏的上限
+/// 依据，改动它会一并放大单群单轮的翻页量与峰值内存。
+pub const max_lookback_seconds: i64 = 7 * seconds_per_day;
 
 /// 扫描窗口起点，逐群独立：按这个群自己的 `last_run`（`hikari:lastrun:{group_id}`）
 /// 算，而不是固定回看 24 小时——固定 24h 的话，停机超过一天的那段永远不会被
